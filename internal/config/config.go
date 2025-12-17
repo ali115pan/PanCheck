@@ -142,7 +142,7 @@ func Load(configPath string) error {
 
 	// 设置默认值（如果仍然为空）
 	if AppConfig.Server.Port == 0 {
-		AppConfig.Server.Port = 8080
+		AppConfig.Server.Port = 6080
 	}
 	if AppConfig.Server.Mode == "" {
 		AppConfig.Server.Mode = "debug"
@@ -172,7 +172,7 @@ func Load(configPath string) error {
 // setDefaults 设置默认配置
 func setDefaults() {
 	// 服务器默认配置
-	viper.SetDefault("SERVER_PORT", 8080)
+	viper.SetDefault("SERVER_PORT", 6080)
 	viper.SetDefault("SERVER_MODE", "debug")
 	viper.SetDefault("SERVER_CORS_ORIGINS", "*")
 

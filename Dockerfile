@@ -73,7 +73,7 @@ COPY --from=backend-builder /app/backend/static ./static
 RUN mkdir -p /app/data
 
 # 暴露端口
-EXPOSE 8080
+EXPOSE 6080
 
 # 启动应用
 CMD ["./main"]

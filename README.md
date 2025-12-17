@@ -41,9 +41,9 @@ services:
     image: lampon/pancheck:latest
     container_name: pancheck
     ports:
-      - "8080:8080"
+      - "6080:6080"
     environment:
-      - SERVER_PORT=8080 # 服务端口
+      - SERVER_PORT=6080 # 服务端口
       - SERVER_MODE=release # 服务模式
       - SERVER_CORS_ORIGINS=* # 跨域请求允许的源
       - DATABASE_TYPE=mysql # 数据库类型
@@ -69,7 +69,7 @@ services:
       - db
       - redis
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/v1/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:6080/api/v1/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -116,7 +116,7 @@ volumes:
 
 ```env
 # 服务器配置
-SERVER_PORT=8080                    # 服务端口
+SERVER_PORT=6080                    # 服务端口
 SERVER_MODE=release                 # 服务模式（release/debug）
 SERVER_CORS_ORIGINS=*               # 跨域请求允许的源
 
@@ -145,7 +145,7 @@ ADMIN_PASSWORD=admin123             # 后台管理密码（请修改）
 ```
 
 
-服务启动后，访问 `http://localhost:8080` 即可使用。
+服务启动后，访问 `http://localhost:6080` 即可使用。
 
 ### 本地开发部署
 
@@ -273,7 +273,7 @@ Content-Type: application/json
 **使用示例（cURL）：**
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/links/check \
+curl -X POST http://localhost:6080/api/v1/links/check \
   -H "Content-Type: application/json" \
   -d '{
     "links": [
@@ -286,7 +286,7 @@ curl -X POST http://localhost:8080/api/v1/links/check \
 **使用示例（JavaScript）：**
 
 ```javascript
-const response = await fetch('http://localhost:8080/api/v1/links/check', {
+const response = await fetch('http://localhost:6080/api/v1/links/check', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
@@ -311,7 +311,7 @@ console.log('失效链接:', result.invalid_links);
 
 ### 访问管理后台
 
-1. 在浏览器中访问：`http://localhost:8080/admin/login`
+1. 在浏览器中访问：`http://localhost:6080/admin/login`
 
 2. 输入管理员密码（默认密码在 `.env` 文件中的 `ADMIN_PASSWORD` 配置，默认值为 `admin`）
 
@@ -369,7 +369,7 @@ REDIS_INVALID_TTL=168  # 失效链接缓存 168 小时（7天）
 
 1. 确认服务已正常启动
 2. 检查防火墙设置
-3. 确认访问地址正确：`http://localhost:8080/admin/login`
+3. 确认访问地址正确：`http://localhost:6080/admin/login`
 
 
 
