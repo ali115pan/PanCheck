@@ -7,10 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -98,6 +97,17 @@ func (c *BaiduChecker) Check(link string) (*CheckResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.GetTimeout())
 	defer cancel()
 
+	// 提取分享ID (surl)
+	surl := extractBaiduShareID(normalizedLink)
+	if surl == "" {
+		return &CheckResult{
+			Valid:         false,
+			FailureReason: "无效的分享链接格式",
+			Duration:      time.Since(start).Milliseconds(),
+		}, nil
+	}
+
+	// 提取密码
 	parsedURL, err := url.Parse(normalizedLink)
 	if err != nil {
 		return &CheckResult{
@@ -106,161 +116,139 @@ func (c *BaiduChecker) Check(link string) (*CheckResult, error) {
 			Duration:      time.Since(start).Milliseconds(),
 		}, nil
 	}
+	password := parsedURL.Query().Get("pwd")
 
-	queryParams := parsedURL.Query()
-	password := queryParams.Get("pwd")
+	// 计算shorturl（去掉首字符）
+	shorturl := getShorturl(surl)
 
-	// 第一步：初始请求
-	step1Result, err := step1Request(ctx, normalizedLink)
-	if err != nil {
-		return &CheckResult{
-			Valid:         false,
-			FailureReason: "第一步请求失败: " + err.Error(),
-			Duration:      time.Since(start).Milliseconds(),
-		}, nil
-	}
+	// 构建/share/list API URL
+	apiURL := fmt.Sprintf("https://pan.baidu.com/share/list?web=5&app_id=250528&desc=1&showempty=0&page=1&num=20&order=time&shorturl=%s&root=1&view_mode=1&channel=chunlei&web=1&clienttype=0",
+		url.QueryEscape(shorturl))
 
-	// 过期 200
-	if step1Result.StatusCode == 200 && step1Result.FullRedirectURL == "" {
-		return &CheckResult{
-			Valid:         false,
-			FailureReason: "分享文件已过期",
-			Duration:      time.Since(start).Milliseconds(),
-		}, nil
-	}
+	var bdclnd string
 
-	// 正常 302
-	if step1Result.StatusCode != 302 || step1Result.FullRedirectURL == "" || step1Result.SURL == "" {
-		return &CheckResult{
-			Valid:         false,
-			FailureReason: "第一步302失败",
-			Duration:      time.Since(start).Milliseconds(),
-			IsRateLimited: true, // 第一步302失败表示被平台限制
-		}, nil
-	}
-
-	// 第二步：验证请求
-	step2Result, err := step2Request(ctx, step1Result, password)
-	if err != nil {
-		return &CheckResult{
-			Valid:         false,
-			FailureReason: "第二步请求失败: " + err.Error(),
-			Duration:      time.Since(start).Milliseconds(),
-		}, nil
-	}
-
-	// 如果响应包含JSON，根据errno判断错误类型
-	if step2Result.JSONResponse != nil {
-		errno := step2Result.JSONResponse.Errno
-		errMsg := step2Result.JSONResponse.ErrMsg
-
-		switch errno {
-		case -12:
-			// 缺少提取码
+	// 如果URL中带有提取码，先验证提取码
+	if password != "" {
+		randsk, err := verifyPassCode(ctx, normalizedLink, shorturl, password)
+		if err != nil {
+			failureReason := fmt.Sprintf("验证提取码失败: %v", err)
 			return &CheckResult{
 				Valid:         false,
-				FailureReason: fmt.Sprintf("缺少提取码 (errno: %d, err_msg: %s)", errno, errMsg),
-				Duration:      time.Since(start).Milliseconds(),
-				IsRateLimited: false,
-			}, nil
-		case -9:
-			// 提取码错误
-			return &CheckResult{
-				Valid:         false,
-				FailureReason: fmt.Sprintf("提取码错误 (errno: %d, err_msg: %s)", errno, errMsg),
-				Duration:      time.Since(start).Milliseconds(),
-				IsRateLimited: false,
-			}, nil
-		case -62:
-			// 请求接口受限
-			return &CheckResult{
-				Valid:         false,
-				FailureReason: fmt.Sprintf("请求接口受限 (errno: %d, err_msg: %s)", errno, errMsg),
-				Duration:      time.Since(start).Milliseconds(),
-				IsRateLimited: true,
-			}, nil
-		case 0:
-			// errno为0表示成功，继续检查BDCLND Cookie
-		default:
-			// 其他错误码
-			return &CheckResult{
-				Valid:         false,
-				FailureReason: fmt.Sprintf("第二步验证失败 (errno: %d, err_msg: %s)", errno, errMsg),
+				FailureReason: failureReason,
 				Duration:      time.Since(start).Milliseconds(),
 				IsRateLimited: false,
 			}, nil
 		}
+		bdclnd = randsk
 	}
 
-	// 如果errno为0或未解析到JSON，检查BDCLND Cookie
-	if step2Result.BDCLND == "" {
-		failureReason := fmt.Sprintf("第二步响应未返回BDCLND Cookie (StatusCode: %d, Response: %s)", step2Result.StatusCode, step2Result.Body)
+	// 调用/share/list API（如果有提取码则带上BDCLND，否则不带）
+	result, err := callShareListAPI(ctx, apiURL, normalizedLink, bdclnd)
+	if err != nil {
+		log.Printf("[BaiduChecker] /share/list API请求失败: %v", err)
 		return &CheckResult{
 			Valid:         false,
-			FailureReason: failureReason,
+			FailureReason: "请求失败: " + err.Error(),
 			Duration:      time.Since(start).Milliseconds(),
-			IsRateLimited: true, // 第二步响应未返回BDCLND Cookie表示被平台限制
+			IsRateLimited: true,
 		}, nil
 	}
 
+	// 检查errno
+	errno := result.Errno
+	errMsg := result.ErrMsg
+
+	// 如果errno=0，表示链接有效
+	if errno == 0 {
+		return &CheckResult{
+			Valid:         true,
+			FailureReason: "",
+			Duration:      time.Since(start).Milliseconds(),
+		}, nil
+	}
+
+	// 根据errno判断失败原因
+	failureReason := getFailureReason(errno, errMsg)
+	isRateLimited := errno == -62 // -62表示请求接口受限
+
 	return &CheckResult{
-		Valid:         true,
-		FailureReason: "",
+		Valid:         false,
+		FailureReason: failureReason,
 		Duration:      time.Since(start).Milliseconds(),
+		IsRateLimited: isRateLimited,
 	}, nil
 }
 
-// Step1Response 第一步响应结构体
-type Step1Response struct {
-	StatusCode      int
-	Location        string
-	FullRedirectURL string
-	SetCookies      []*http.Cookie
-	SURL            string
-}
-
-// Step2Response 第二步响应结构体
-type Step2Response struct {
-	StatusCode   int
-	SetCookies   []*http.Cookie
-	BDCLND       string
-	Body         string             // 响应体内容
-	JSONResponse *Step2JSONResponse // 解析后的JSON响应
-}
-
-// Step2JSONResponse 第二步JSON响应结构体
-type Step2JSONResponse struct {
-	Errno     int    `json:"errno"`
-	ErrMsg    string `json:"err_msg"`
-	RequestID int64  `json:"request_id"`
-}
-
-// Step3Response 第三步响应结构体
-type Step3Response struct {
-	JSONResponse *ShareListResponse
-}
-
-// ShareListResponse 第三步JSON响应结构体
+// ShareListResponse /share/list API响应结构体
 type ShareListResponse struct {
-	Errno int    `json:"errno"`
-	Title string `json:"title"`
+	Errno  float64 `json:"errno"`
+	ErrMsg string  `json:"errmsg"`
+	Title  string  `json:"title,omitempty"`
 }
 
-// step1Request 第一步请求
-func step1Request(ctx context.Context, targetURL string) (*Step1Response, error) {
+// extractBaiduShareID 从URL中提取分享ID (surl)
+func extractBaiduShareID(shareURL string) string {
+	parsedURL, err := url.Parse(shareURL)
+	if err != nil {
+		return ""
+	}
+
+	// 处理 /s/ 格式
+	path := parsedURL.Path
+	if strings.HasPrefix(path, "/s/") {
+		surl := strings.TrimPrefix(path, "/s/")
+		// 移除可能的查询参数部分（如果URL格式不规范）
+		if idx := strings.Index(surl, "?"); idx != -1 {
+			surl = surl[:idx]
+		}
+		return surl
+	}
+
+	// 处理 /share/init?surl= 格式
+	if strings.HasPrefix(path, "/share/init") {
+		surl := parsedURL.Query().Get("surl")
+		if surl != "" {
+			return surl
+		}
+	}
+
+	return ""
+}
+
+// getShorturl 获取shorturl（去掉首字符的surl）
+func getShorturl(surl string) string {
+	if len(surl) > 1 {
+		return surl[1:]
+	}
+	return surl
+}
+
+// callShareListAPI 调用/share/list API
+func callShareListAPI(ctx context.Context, apiURL, refererURL, bdclnd string) (*ShareListResponse, error) {
 	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
 		Timeout: 30 * time.Second,
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("创建请求失败: %v", err)
 	}
 
-	setStep1Headers(req)
+	// 设置请求头（参考baidu.txt）
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "zh,en-GB;q=0.9,en-US;q=0.8,en;q=0.7,zh-CN;q=0.6")
+
+	// 如果提供了bdclnd，设置Cookie
+	if bdclnd != "" {
+		req.Header.Set("Cookie", fmt.Sprintf("BDCLND=%s", bdclnd))
+	}
+
+	// 设置Referer
+	if refererURL != "" {
+		req.Header.Set("Referer", refererURL)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -268,184 +256,106 @@ func step1Request(ctx context.Context, targetURL string) (*Step1Response, error)
 	}
 	defer resp.Body.Close()
 
-	return parseStep1Response(resp, targetURL)
-}
-
-// setStep1Headers 设置第一步请求头
-func setStep1Headers(req *http.Request) {
-	headers := map[string]string{
-		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-		"Accept-Language":           "en",
-		"Connection":                "keep-alive",
-		"Sec-Fetch-Dest":            "document",
-		"Sec-Fetch-Mode":            "navigate",
-		"Sec-Fetch-Site":            "none",
-		"Sec-Fetch-User":            "?1",
-		"Upgrade-Insecure-Requests": "1",
-		"User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-	}
-
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-}
-
-// parseStep1Response 解析第一步响应
-func parseStep1Response(resp *http.Response, originalURL string) (*Step1Response, error) {
-	result := &Step1Response{
-		StatusCode: resp.StatusCode,
-		Location:   resp.Header.Get("Location"),
-		SetCookies: resp.Cookies(),
-	}
-
-	if result.Location != "" {
-		fullURL, err := buildFullRedirectURL(originalURL, result.Location)
-		if err != nil {
-			return nil, fmt.Errorf("构建重定向URL失败: %v", err)
-		}
-		result.FullRedirectURL = fullURL
-
-		if surl, err := extractSURLFromLocation(result.Location); err == nil {
-			result.SURL = surl
-		}
-	}
-
-	return result, nil
-}
-
-// step2Request 第二步请求
-func step2Request(ctx context.Context, step1Result *Step1Response, password string) (*Step2Response, error) {
-	jar, err := cookiejar.New(nil)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("创建Cookie Jar失败: %v", err)
+		return nil, fmt.Errorf("读取响应体失败: %v", err)
+	}
+
+	var result ShareListResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		// 如果JSON解析失败，尝试获取errno字段
+		var jsonMap map[string]interface{}
+		if err2 := json.Unmarshal(body, &jsonMap); err2 == nil {
+			if errno, ok := jsonMap["errno"].(float64); ok {
+				result.Errno = errno
+			}
+			if errmsg, ok := jsonMap["errmsg"].(string); ok {
+				result.ErrMsg = errmsg
+			} else if errmsg, ok := jsonMap["err_msg"].(string); ok {
+				result.ErrMsg = errmsg
+			}
+		} else {
+			return nil, fmt.Errorf("解析JSON响应失败: %v, Body: %s", err, string(body))
+		}
+	}
+
+	return &result, nil
+}
+
+// verifyPassCode 验证提取码
+func verifyPassCode(ctx context.Context, shareURL, shorturl, password string) (string, error) {
+	// 构建验证URL
+	apiURL := fmt.Sprintf("https://pan.baidu.com/share/verify?surl=%s&pwd=%s", url.QueryEscape(shorturl), url.QueryEscape(password))
+	reqBody := url.Values{
+		"pwd":       {password},
+		"vcode":     {""},
+		"vcode_str": {""},
 	}
 
 	client := &http.Client{
-		Jar:     jar,
 		Timeout: 30 * time.Second,
 	}
 
-	baseURL := "https://pan.baidu.com/share/verify"
-	params := url.Values{}
-	params.Add("t", strconv.FormatInt(time.Now().UnixMilli(), 10))
-	params.Add("surl", step1Result.SURL)
-	params.Add("channel", "chunlei")
-	params.Add("web", "1")
-	params.Add("app_id", "250528")
-	params.Add("clienttype", "0")
-
-	fullURL := baseURL + "?" + params.Encode()
-
-	postData := url.Values{}
-	postData.Add("pwd", password)
-	postData.Add("vcode", "")
-	postData.Add("vcode_str", "")
-
-	req, err := http.NewRequestWithContext(ctx, "POST", fullURL, bytes.NewBufferString(postData.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewBufferString(reqBody.Encode()))
 	if err != nil {
-		return nil, fmt.Errorf("创建第二步请求失败: %v", err)
+		return "", fmt.Errorf("创建验证请求失败: %v", err)
 	}
 
-	setStep2Headers(req, step1Result.FullRedirectURL)
-
-	u, _ := url.Parse("https://pan.baidu.com")
-	jar.SetCookies(u, step1Result.SetCookies)
+	// 设置请求头
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", shareURL)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("第二步请求失败: %v", err)
+		return "", fmt.Errorf("验证请求失败: %v", err)
 	}
 	defer resp.Body.Close()
 
-	// 读取响应体
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取第二步响应体失败: %v", err)
+		return "", fmt.Errorf("读取响应体失败: %v", err)
 	}
 
-	return parseStep2Response(resp, string(body))
-}
-
-// setStep2Headers 设置第二步请求头
-func setStep2Headers(req *http.Request, refererURL string) {
-	headers := map[string]string{
-		"Accept":           "application/json, text/javascript, */*; q=0.01",
-		"Accept-Language":  "en",
-		"Connection":       "keep-alive",
-		"Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
-		"Origin":           "https://pan.baidu.com",
-		"Referer":          refererURL,
-		"Sec-Fetch-Dest":   "empty",
-		"Sec-Fetch-Mode":   "cors",
-		"Sec-Fetch-Site":   "same-origin",
-		"User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-		"X-Requested-With": "XMLHttpRequest",
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("解析验证响应失败: %v, Body: %s", err, string(body))
 	}
 
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-}
-
-// parseStep2Response 解析第二步响应
-func parseStep2Response(resp *http.Response, body string) (*Step2Response, error) {
-	result := &Step2Response{
-		StatusCode: resp.StatusCode,
-		SetCookies: resp.Cookies(),
-		Body:       body,
-	}
-
-	// 解析JSON响应
-	var jsonResp Step2JSONResponse
-	if err := json.Unmarshal([]byte(body), &jsonResp); err == nil {
-		result.JSONResponse = &jsonResp
-	}
-
-	for _, cookie := range result.SetCookies {
-		if cookie.Name == "BDCLND" {
-			result.BDCLND = cookie.Value
-			break
+	if errno, ok := result["errno"].(float64); !ok || errno != 0 {
+		errmsg := "未知错误"
+		if msg, exists := result["errmsg"].(string); exists {
+			errmsg = msg
+		} else if msg, exists := result["err_msg"].(string); exists {
+			errmsg = msg
 		}
+		return "", fmt.Errorf("验证提取码失败: errno=%v, errmsg=%s", errno, errmsg)
 	}
 
-	return result, nil
+	if randsk, ok := result["randsk"].(string); ok && randsk != "" {
+		return randsk, nil
+	}
+
+	return "", fmt.Errorf("验证响应格式错误，没有randsk字段")
 }
 
-// buildFullRedirectURL 构建完整的重定向URL
-func buildFullRedirectURL(baseURL, location string) (string, error) {
-	if location == "" {
-		return "", fmt.Errorf("location为空")
+// getFailureReason 根据errno获取失败原因
+func getFailureReason(errno float64, errMsg string) string {
+	if errMsg != "" {
+		return fmt.Sprintf("分享链接无效 (errno: %.0f, err_msg: %s)", errno, errMsg)
 	}
 
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return "", err
+	// 根据常见错误码提供更友好的提示
+	switch int(errno) {
+	case -12:
+		return "缺少提取码 (errno: -12)"
+	case -9:
+		return "提取码错误 (errno: -9)"
+	case -62:
+		return "请求接口受限 (errno: -62)"
+	case -8:
+		return "分享文件已过期 (errno: -8)"
+	default:
+		return fmt.Sprintf("分享链接无效 (errno: %.0f)", errno)
 	}
-
-	redirect, err := url.Parse(location)
-	if err != nil {
-		return "", err
-	}
-
-	return base.ResolveReference(redirect).String(), nil
-}
-
-// extractSURLFromLocation 从Location中提取surl参数
-func extractSURLFromLocation(location string) (string, error) {
-	parsedURL, err := url.Parse(location)
-	if err != nil {
-		return "", err
-	}
-
-	queryParams, err := url.ParseQuery(parsedURL.RawQuery)
-	if err != nil {
-		return "", err
-	}
-
-	surl := queryParams.Get("surl")
-	if surl == "" {
-		return "", fmt.Errorf("未找到surl参数")
-	}
-
-	return surl, nil
 }
